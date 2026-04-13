@@ -1,0 +1,345 @@
+"""
+Clap Detection Script with dB Meter
+Detects double claps and triggers configured actions
+"""
+
+import sounddevice as sd
+import numpy as np
+import subprocess
+import sys
+import time
+import requests
+from collections import deque
+from config import (
+    COMMANDS,
+    COMMAND_DELAY,
+    CLAPS_TO_TRIGGER,
+    CLAP_THRESHOLD,
+    CLAP_TIME_WINDOW,
+    SAMPLE_RATE,
+    CHUNK_SIZE,
+    AUDIO_DEVICE_INDEX,
+    DEBUG,
+    HA_ACTIONS
+)
+
+
+class ClapDetector:
+    def __init__(self):
+        self.clap_times = deque()
+        self.is_running = False
+        self.last_clap_time = 0
+        self.clap_cooldown = 0.15  # Minimum time between claps
+        
+    def list_microphones(self):
+        """Print available audio devices with details"""
+        print("\n" + "="*60)
+        print("AVAILABLE AUDIO INPUT DEVICES:")
+        print("="*60)
+        devices = sd.query_devices()
+        mic_count = 0
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:
+                default_marker = " (DEFAULT)" if i == sd.default.device[0] else ""
+                sample_rate = int(device['default_samplerate'])
+                print(f"  Index: {i} {default_marker}")
+                print(f"    Name: {device['name']}")
+                print(f"    Channels: {device['max_input_channels']}")
+                print(f"    Sample Rate: {sample_rate} Hz")
+                print()
+                mic_count += 1
+        
+        if mic_count == 0:
+            print("  No input devices found!")
+        else:
+            print(f"Total: {mic_count} input device(s)")
+        print("="*60)
+        print("\nTo use a specific device, set AUDIO_DEVICE_INDEX in config.py")
+        print("="*60 + "\n")
+
+    def select_microphone_interactive(self):
+        """Interactive device selection"""
+        print("\n" + "="*60)
+        print("SELECT AUDIO INPUT DEVICE:")
+        print("="*60)
+        devices = sd.query_devices()
+        input_devices = []
+        
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:
+                input_devices.append(i)
+                default_marker = " <- DEFAULT" if i == sd.default.device[0] else ""
+                print(f"  [{len(input_devices)}] {device['name']}{default_marker}")
+        
+        if not input_devices:
+            print("  No input devices found!")
+            return None
+        
+        print(f"\n  [0] Use default device")
+        
+        try:
+            choice = input("\nEnter device number (or press Enter for default): ").strip()
+            if not choice or choice == "0":
+                device_idx = sd.default.device[0]
+                print(f"\nUsing default device: {sd.query_devices(device_idx)['name']}")
+                return device_idx
+            
+            choice_num = int(choice) - 1
+            if 0 <= choice_num < len(input_devices):
+                device_idx = input_devices[choice_num]
+                print(f"\nUsing device: {sd.query_devices(device_idx)['name']}")
+                return device_idx
+            else:
+                print("Invalid selection!")
+                return None
+        except (ValueError, KeyboardInterrupt):
+            print("\nUsing default device...")
+            return None
+
+    def calculate_db(self, audio_chunk):
+        """Calculate dB level from audio chunk"""
+        audio_normalized = np.abs(audio_chunk.flatten())
+        rms_energy = np.sqrt(np.mean(audio_normalized ** 2))
+        
+        # Convert to dB (with floor at -80 dB to avoid log(0))
+        if rms_energy > 0:
+            db = 20 * np.log10(rms_energy)
+        else:
+            db = -80
+        
+        return db, rms_energy
+
+    def draw_db_meter(self, db, rms):
+        """Draw a visual dB meter"""
+        # Normalize db to 0-100 scale (-60 to 0 dB)
+        meter_value = max(0, min(100, (db + 60) / 0.6))
+        filled = int(meter_value / 5)
+        empty = 20 - filled
+        
+        # Color coding based on level
+        if db > -5:  # Likely a clap
+            color = "🔴"
+            status = "CLAP!"
+        elif db > -20:
+            color = "🟠"
+            status = "LOUD"
+        elif db > -40:
+            color = "🟡"
+            status = "MED "
+        else:
+            color = "🟢"
+            status = "quiet"
+        
+        bar = "█" * filled + "░" * empty
+        return f"{color} [{bar}] {db:6.1f}dB ({status}) | RMS: {rms:.4f}"
+
+    def detect_clap(self, audio_chunk):
+        """
+        Detect if audio chunk contains a clap using multiple heuristics
+        """
+        db, rms = self.calculate_db(audio_chunk)
+        
+        # Print meter
+        print(f"\r{self.draw_db_meter(db, rms)}", end="", flush=True)
+        
+        # Check if above threshold and enough time has passed since last clap
+        current_time = time.time()
+        if rms > CLAP_THRESHOLD and (current_time - self.last_clap_time) > self.clap_cooldown:
+            # Additional check: look for frequency content typical of claps (1-3 kHz)
+            if len(audio_chunk) > 1:
+                fft = np.fft.fft(audio_chunk.flatten())
+                freqs = np.fft.fftfreq(len(fft), 1/SAMPLE_RATE)
+                
+                # Look at magnitude in clap frequency range (1-3 kHz)
+                clap_range = np.abs(fft[(freqs > 1000) & (freqs < 3000)])
+                if len(clap_range) > 0 and np.max(clap_range) > np.max(np.abs(fft)) * 0.3:
+                    self.last_clap_time = current_time
+                    return True
+        
+        return False
+
+    def execute_command(self):
+        """Execute all configured commands"""
+        try:
+            ha_command_index = 0
+            
+            for i, cmd in enumerate(COMMANDS):
+                if cmd == 'home-assistant':
+                    if ha_command_index < len(HA_ACTIONS):
+                        ha_config = HA_ACTIONS[ha_command_index]
+                        if ha_config['enabled']:
+                            print(f"\n  ✓ [{i+1}] Sending to Home Assistant: {ha_config['action']} on {ha_config['entity_id']}")
+                            self.call_home_assistant(ha_config)
+                        ha_command_index += 1
+                else:
+                    print(f"\n  ✓ [{i+1}] Executing: {cmd}")
+                    subprocess.Popen(cmd, shell=True)
+                
+                # Delay between commands
+                if i < len(COMMANDS) - 1:
+                    time.sleep(COMMAND_DELAY)
+            
+            return True
+        except Exception as e:
+            print(f"\n  ✗ Error executing commands: {e}")
+            return False
+
+    def call_home_assistant(self, ha_config):
+        """Call Home Assistant API with given config"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {ha_config["token"]}',
+                'Content-Type': 'application/json'
+            }
+            
+            url = None
+            payload = {}
+            
+            if ha_config['action'] == 'toggle_switch':
+                url = f"{ha_config['url']}/api/services/switch/toggle"
+                payload = {'entity_id': ha_config['entity_id']}
+                
+            elif ha_config['action'] == 'toggle_light':
+                url = f"{ha_config['url']}/api/services/light/toggle"
+                payload = {'entity_id': ha_config['entity_id']}
+                
+            elif ha_config['action'] == 'activate_scene':
+                url = f"{ha_config['url']}/api/services/scene/turn_on"
+                payload = {'entity_id': ha_config['entity_id']}
+                
+            elif ha_config['action'] == 'call_service':
+                service_domain, service_name = ha_config['service'].split('.')
+                url = f"{ha_config['url']}/api/services/{service_domain}/{service_name}"
+                payload = {'entity_id': ha_config['entity_id']}
+            
+            if url is None:
+                print(f"    ✗ Unknown action: {ha_config['action']}")
+                return False
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            
+            if response.status_code in [200, 201]:
+                print(f"    ✓ Home Assistant action successful")
+                return True
+            else:
+                print(f"    ✗ Home Assistant error: {response.status_code} - {response.text}")
+                return False
+                
+        except requests.exceptions.ConnectionError:
+            print(f"    ✗ Could not connect to Home Assistant at {ha_config['url']}")
+            return False
+        except Exception as e:
+            print(f"    ✗ Error calling Home Assistant: {e}")
+            return False
+
+    def process_clap(self):
+        """Handle clap detection logic"""
+        current_time = time.time()
+        
+        # Remove claps outside the time window
+        while self.clap_times and (current_time - self.clap_times[0]) > CLAP_TIME_WINDOW:
+            self.clap_times.popleft()
+        
+        # Add current clap
+        self.clap_times.append(current_time)
+        
+        clap_count = len(self.clap_times)
+        
+        if clap_count < CLAPS_TO_TRIGGER:
+            print(f"\n✓ Clap {clap_count}/{CLAPS_TO_TRIGGER} detected - waiting for 2nd clap within {CLAP_TIME_WINDOW}s")
+        
+        # Check if we have enough claps
+        if clap_count >= CLAPS_TO_TRIGGER:
+            print(f"\n🎉 DOUBLE CLAP DETECTED!")
+            self.execute_command()
+            self.clap_times.clear()
+
+    def run(self):
+        """Main detection loop"""
+        self.is_running = True
+        
+        try:
+            # Validate device index
+            device_index = AUDIO_DEVICE_INDEX
+            if device_index is not None:
+                try:
+                    device_info = sd.query_devices(device_index)
+                    if device_info['max_input_channels'] == 0:
+                        print(f"⚠️  Device {device_index} has no input channels!")
+                        device_index = None
+                except Exception as e:
+                    print(f"⚠️  Device {device_index} not found: {e}")
+                    device_index = None
+            
+            print("🎤 Clap Detector Started")
+            print(f"   Listening for {CLAPS_TO_TRIGGER} clap(s) within {CLAP_TIME_WINDOW}s")
+            print(f"   Commands: {len(COMMANDS)} action(s) configured")
+            print("   Press Ctrl+C to stop\n")
+            print("   dB Meter (watch this to calibrate):\n")
+            
+            with sd.InputStream(
+                device=device_index,
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                blocksize=CHUNK_SIZE,
+                latency='low'
+            ) as stream:
+                device_used = sd.query_devices(device_index)['name'] if device_index is not None else sd.query_devices(sd.default.device[0])['name']
+                print(f"   Using device: {device_used}\n")
+                
+                while self.is_running:
+                    try:
+                        audio_chunk, _ = stream.read(CHUNK_SIZE)
+                        
+                        if self.detect_clap(audio_chunk):
+                            self.process_clap()
+                            
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"Error reading audio: {e}")
+                    
+        except ValueError as e:
+            print(f"❌ Error: Invalid audio device")
+            print(f"   Details: {e}")
+            print("\nAvailable devices:")
+            self.list_microphones()
+            print("Update AUDIO_DEVICE_INDEX in config.py or run with --select-device")
+            
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            print("\nTroubleshooting:")
+            print("  1. Check microphone is connected")
+            print("  2. Run: python clap_detector.py --list-devices")
+            print("  3. Run: python clap_detector.py --select-device")
+            print("  4. Or manually set AUDIO_DEVICE_INDEX in config.py")
+            
+        finally:
+            print("\n\n👋 Clap Detector Stopped")
+
+    def stop(self):
+        """Stop the detector"""
+        self.is_running = False
+
+
+if __name__ == '__main__':
+    detector = ClapDetector()
+    
+    # Check for command line arguments
+    if '--list-devices' in sys.argv:
+        detector.list_microphones()
+        sys.exit(0)
+    
+    if '--select-device' in sys.argv:
+        device_idx = detector.select_microphone_interactive()
+        if device_idx is not None:
+            print(f"\n✓ Add this to config.py:")
+            print(f"  AUDIO_DEVICE_INDEX = {device_idx}")
+        sys.exit(0)
+    
+    # Start detector
+    try:
+        detector.run()
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+        detector.stop()
