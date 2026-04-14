@@ -162,36 +162,6 @@ AUDIO_DEVICE_INDEX = 2  # Use device index 2
 4. After detecting the configured number of claps within the time window, executes the command
 5. Resets counter and waits for next clap sequence
 
-## Beautiful Terminal UI
-
-The Clap Detector features a stunning terminal interface with:
-
-- **ASCII Art Headers** - Eye-catching title and status displays
-- **Color-Coded Output** - Visual feedback with bright colors and emojis
-- **Real-Time Audio Meter** - Live dB level visualization with color gradients
-- **Structured Boxes** - Information organized in elegant bordered sections
-- **Status Indicators** - Clear visual markers for claps, errors, and successes
-- **Command Execution Display** - Watch as your commands execute in real-time
-
-### Example UI Features:
-
-```
-╔════════════════════════════════════════════════════════════════════════════╗
-║                                                                            ║
-║   ╔═══════════════════════════════════════════════════════════════════╗   ║
-║   ║                        🎙️  CLAP DETECTOR 🎙️                       ║   ║
-║   ║                  Hand Clap Recognition System                     ║   ║
-║   ╚═══════════════════════════════════════════════════════════════════╝   ║
-```
-
-**Features:**
-- Real-time dB meter with threshold indicator
-- Animated clap detection counter
-- Color-coded device list
-- Beautiful error messages with suggestions
-- Command execution tracking
-- Celebration display on successful clap trigger
-
 ## Tips
 
 - **Sensitivity:** Start with CLAP_THRESHOLD = 0.02, adjust up or down
